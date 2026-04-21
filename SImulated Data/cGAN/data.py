@@ -1,7 +1,68 @@
+# ============================================================================
+# data.py — Conditional Financial Time Series Data Pipeline
+# ============================================================================
+"""
+This module extends the original data pipeline to support MULTI-REGIME
+conditional GAN training:
+
+    Multiple CSVs (each representing a market regime)
+        → log returns (per file)
+        → GLOBAL z-score normalization (across ALL files)
+        → rolling windows (per file, each tagged with a regime label)
+        → unified PyTorch DataLoader yielding (window, label) pairs
+
+NEW CONCEPT: MULTI-REGIME DATA HANDLING
+────────────────────────────────────────
+There are three ways to assign regime labels:
+
+  Method 1: MANUAL (explicit pairing)
+    You assign labels when constructing the dataset:
+      csv_label_pairs = [
+          ('data/SPY_bull_2017.csv', 'Bullish'),
+          ('data/SPY_crash_2020.csv', 'Crash'),
+      ]
+    Best when you have domain knowledge about specific historical periods.
+
+  Method 2: AUTOMATIC (statistics-based)
+    A labeling function analyzes each window and assigns a regime based on
+    its mean return and volatility:
+      - High return, low vol   → Bullish
+      - Low return, high vol   → Crash
+      - etc.
+    Best for large datasets where manual labeling is impractical.
+
+  Method 3: FILENAME CONVENTION
+    If CSV filenames contain regime keywords (e.g., 'tech_crash.csv'),
+    the code automatically extracts the label.
+    Best for quick experimentation.
+
+NORMALIZATION STRATEGY FOR MULTI-REGIME DATA
+─────────────────────────────────────────────
+We normalize GLOBALLY across ALL regimes using pooled statistics.
+This preserves the RELATIVE differences between regimes:
+  - Crash windows will have larger absolute normalized values (higher vol)
+  - Sideways windows will have smaller absolute normalized values (lower vol)
+
+If we normalized per-regime, all regimes would look similar (zero mean,
+unit variance) and the conditioning would carry NO information in the data
+itself — the model would rely entirely on the embedding to differentiate.
+Global normalization means the data itself carries regime signal too.
+
+WHY LOG RETURNS and WHY Z-SCORE?  (Same as original — see original comments)
+"""
+
 import numpy as np
 import pandas as pd
 import torch
 from torch.utils.data import Dataset, DataLoader, ConcatDataset
+
+
+# ──────────────────────────────────────────────────────────────
+# Regime definitions
+# ──────────────────────────────────────────────────────────────
+# Default regime mapping — maps human-readable names to integer labels.
+# You can customize this for your use case (e.g., add 'Recovery', 'Bubble').
+# The integer labels are what the neural network actually sees.
 
 DEFAULT_REGIME_MAP = {
     'Bullish':  0,
@@ -10,10 +71,26 @@ DEFAULT_REGIME_MAP = {
     'Crash':    3,
 }
 
+# Reverse mapping: integer → name (for display and plotting)
 DEFAULT_REGIME_NAMES = {v: k for k, v in DEFAULT_REGIME_MAP.items()}
 
 
 class ReturnSequenceDataset(Dataset):
+    """
+    PyTorch Dataset that converts raw price data into normalized return windows,
+    each paired with a REGIME LABEL.
+
+    CHANGED from original:
+      - Now stores a regime_label (integer) for all windows from this file
+      - __getitem__ returns (window_tensor, label_tensor) instead of just
+        window_tensor
+      - Normalization can use externally provided (mu, sigma) for GLOBAL
+        normalization across multiple files
+
+    Each sample is a tuple:
+        (tensor of shape (seq_len, 1),  scalar LongTensor)
+         └─ normalized returns          └─ regime label
+    """
 
     def __init__(self, csv_path, seq_len=50, price_col='Close', stride=1,
                  regime_label=0, global_mu=None, global_sigma=None):
@@ -33,6 +110,9 @@ class ReturnSequenceDataset(Dataset):
         self.seq_len = seq_len
         self.regime_label = regime_label
 
+        # ==============================================================
+        # STEP 1: Load raw price data  (UNCHANGED)
+        # ==============================================================
         df = pd.read_csv(csv_path, parse_dates=True)
 
         if price_col not in df.columns:
@@ -48,9 +128,22 @@ class ReturnSequenceDataset(Dataset):
                 f"Need at least {seq_len + 1}."
             )
 
-
+        # ==============================================================
+        # STEP 2: Compute log returns  (UNCHANGED)
+        # ==============================================================
         self.log_returns = np.diff(np.log(prices))
+        # log_returns shape: (len(prices) - 1,)
 
+        # ==============================================================
+        # STEP 3: Normalize (CHANGED — supports global stats)
+        # ==============================================================
+        # If global stats are provided, use them. Otherwise fall back to
+        # per-file stats (backward compatible with single-file usage).
+        #
+        # Global normalization is CRITICAL for multi-regime training:
+        # it ensures that crash windows (high vol) have larger absolute
+        # values than sideways windows (low vol) after normalization.
+        # ==============================================================
         self.mu = global_mu if global_mu is not None else float(np.mean(self.log_returns))
         self.sigma = global_sigma if global_sigma is not None else float(np.std(self.log_returns))
 
@@ -61,6 +154,10 @@ class ReturnSequenceDataset(Dataset):
             )
 
         self.normalized = (self.log_returns - self.mu) / self.sigma
+
+        # ==============================================================
+        # STEP 4: Create rolling windows  (UNCHANGED)
+        # ==============================================================
         self.windows = []
         n = len(self.normalized)
 
@@ -69,7 +166,9 @@ class ReturnSequenceDataset(Dataset):
             self.windows.append(window)
 
         self.windows = np.array(self.windows, dtype=np.float32)
+        # Shape: (num_windows, seq_len)
 
+        # NEW: Store labels as array (same label for all windows from this file)
         self.labels = np.full(len(self.windows), regime_label, dtype=np.int64)
 
         # --- Diagnostics ---
@@ -86,21 +185,41 @@ class ReturnSequenceDataset(Dataset):
         Returns (window_tensor, label_tensor):
             window_tensor: shape (seq_len, 1)  — one window of normalized returns
             label_tensor:  scalar LongTensor   — regime label (integer)
+
+        CHANGED from original: now returns a TUPLE instead of just the window.
+        This means the DataLoader yields (batch_windows, batch_labels) per batch.
         """
-        window = self.windows[idx]
-        label = self.labels[idx]
+        window = self.windows[idx]                         # (seq_len,)
+        label = self.labels[idx]                           # scalar int
         return (
-            torch.FloatTensor(window).unsqueeze(-1),
-            torch.tensor(label, dtype=torch.long),
+            torch.FloatTensor(window).unsqueeze(-1),       # (seq_len, 1)
+            torch.tensor(label, dtype=torch.long),         # scalar LongTensor
         )
 
     def denormalize(self, data):
-
+        """
+        Invert z-score normalization: r_original = r_normalized * σ + μ
+        Works with both numpy arrays and torch tensors.
+        """
         return data * self.sigma + self.mu
 
 
 class MultiRegimeDataset:
+    """
+    Manages multiple single-regime datasets and provides a unified DataLoader.
 
+    This is NOT a Dataset subclass itself — it's a BUILDER that:
+      1. Computes GLOBAL normalization statistics across all files
+      2. Creates per-regime ReturnSequenceDatasets with global normalization
+      3. Combines them into a single ConcatDataset + DataLoader
+
+    Why a builder and not a single Dataset?
+        Each CSV file may have different lengths, different price scales, etc.
+        By creating separate ReturnSequenceDatasets and combining them with
+        ConcatDataset, PyTorch handles the index mapping automatically.
+        The DataLoader shuffles across ALL regimes, ensuring each batch
+        contains a mix of regimes (important for stable training).
+    """
 
     def __init__(self, csv_label_pairs, seq_len=50, price_col='Close',
                  stride=1, custom_strides=None, regime_map=None):
@@ -118,6 +237,16 @@ class MultiRegimeDataset:
         self.regime_names = {v: k for k, v in self.regime_map.items()}
         self.seq_len = seq_len
 
+        # ==============================================================
+        # STEP 1: Compute GLOBAL normalization statistics
+        # ==============================================================
+        # Pool all returns from ALL files to get a single (mu, sigma).
+        # This ensures regime differences are preserved after normalization.
+        #
+        # Example: If Crash data has σ=0.03 and Sideways has σ=0.005,
+        # after global normalization, Crash windows will have ~6x larger
+        # absolute values — the GAN can see and learn this difference.
+        # ==============================================================
         print("\n[MultiRegime] Computing global normalization statistics...")
         all_log_returns = []
         for csv_path, _ in csv_label_pairs:
@@ -134,9 +263,11 @@ class MultiRegimeDataset:
               f"σ={self.global_sigma:.6f}")
         print(f"[MultiRegime] Total returns pooled: {len(pooled_returns):,}")
 
-
+        # ==============================================================
+        # STEP 2: Create per-regime datasets with global normalization
+        # ==============================================================
         self.datasets = []
-        self.regime_datasets = {}
+        self.regime_datasets = {}  # regime_label → dataset (for per-regime eval)
 
         for csv_path, regime_name in csv_label_pairs:
             if regime_name not in self.regime_map:
@@ -155,12 +286,20 @@ class MultiRegimeDataset:
                 price_col=price_col,
                 stride=this_stride,
                 regime_label=regime_label,
-                global_mu=self.global_mu,
-                global_sigma=self.global_sigma,
+                global_mu=self.global_mu,         # ← Use global stats
+                global_sigma=self.global_sigma,   # ← Use global stats
             )
             self.datasets.append(ds)
             self.regime_datasets[regime_label] = ds
 
+        # ==============================================================
+        # STEP 3: Combine into a single ConcatDataset
+        # ==============================================================
+        # ConcatDataset virtually concatenates all per-regime datasets.
+        # When the DataLoader shuffles, it mixes windows from ALL regimes.
+        # This is crucial: each training batch should contain diverse regimes
+        # so the critic learns to evaluate regime-specific patterns.
+        # ==============================================================
         self.combined_dataset = ConcatDataset(self.datasets)
 
         total = len(self.combined_dataset)
@@ -173,6 +312,10 @@ class MultiRegimeDataset:
         """Denormalize using global statistics."""
         return data * self.global_sigma + self.global_mu
 
+
+# ──────────────────────────────────────────────────────────────
+# Automatic regime labeling functions
+# ──────────────────────────────────────────────────────────────
 
 def auto_label_regime(log_returns, thresholds=None):
     """
@@ -202,11 +345,12 @@ def auto_label_regime(log_returns, thresholds=None):
         String regime name (e.g., 'Bullish', 'Crash')
     """
     if thresholds is None:
+        # Defaults calibrated for daily log returns
         thresholds = {
-            'mean_pos':  0.0002,
-            'mean_neg': -0.0005,
-            'vol_high':  0.015,
-            'vol_crash': 0.025,
+            'mean_pos':  0.0002,     # Annualized ~5%
+            'mean_neg': -0.0005,     # Annualized ~-12%
+            'vol_high':  0.015,      # ~24% annualized
+            'vol_crash': 0.025,      # ~40% annualized
         }
 
     mean_ret = np.mean(log_returns)
@@ -258,6 +402,10 @@ def label_from_filename(csv_path):
     return None
 
 
+# ──────────────────────────────────────────────────────────────
+# Convenience functions
+# ──────────────────────────────────────────────────────────────
+
 def create_regime_dataloader(csv_label_pairs, seq_len=50, batch_size=64,
                               stride=1, custom_strides=None, shuffle=True, regime_map=None,
                               price_col='Close'):
@@ -299,11 +447,17 @@ def create_regime_dataloader(csv_label_pairs, seq_len=50, batch_size=64,
         batch_size=batch_size,
         shuffle=shuffle,
         drop_last=True,
+        # drop_last=True ensures every batch has exactly batch_size samples.
+        # This is even more important in conditional training because
+        # the last batch might have an unbalanced mix of regimes.
     )
 
     return loader, multi_ds
 
 
+# ──────────────────────────────────────────────────────────────
+# Synthetic data generators for each regime
+# ──────────────────────────────────────────────────────────────
 
 def generate_regime_csvs(output_dir=".", n_days=2000, seed=42):
     """
@@ -333,6 +487,7 @@ def generate_regime_csvs(output_dir=".", n_days=2000, seed=42):
 
     rng = np.random.RandomState(seed)
 
+    # Parameters: (annual_drift, annual_vol, jump_probability, jump_scale)
     regime_params = {
         'Bullish':  ( 0.15,  0.15, 0.02, 1.0),
         'Bearish':  (-0.10,  0.25, 0.04, 1.5),
@@ -340,7 +495,7 @@ def generate_regime_csvs(output_dir=".", n_days=2000, seed=42):
         'Crash':    (-0.40,  0.45, 0.10, 3.0),
     }
 
-    dt = 1 / 252
+    dt = 1 / 252    # One trading day
     pairs = []
 
     for regime_name, (drift, vol_annual, jump_prob, jump_scale) in regime_params.items():
@@ -357,15 +512,18 @@ def generate_regime_csvs(output_dir=".", n_days=2000, seed=42):
                       + 0.02 * base_vol * rng.randn())
             vol[t] = max(vol[t], base_vol * 0.1)
 
+            # --- Return = drift + diffusion + occasional jump ---
             returns[t] = drift * dt + vol[t] * rng.randn()
 
+            # Jumps: crash regime has predominantly negative jumps (75% negative)
             if rng.rand() < jump_prob:
                 if regime_name == 'Crash':
-                    jump_sign = rng.choice([-1, -1, -1, 1])
+                    jump_sign = rng.choice([-1, -1, -1, 1])   # 75% negative
                 else:
                     jump_sign = rng.choice([-1, 1])
                 returns[t] += jump_sign * vol[t] * rng.exponential(jump_scale)
 
+        # Cumulative returns → prices
         prices = 100.0 * np.exp(np.cumsum(returns))
 
         # Build OHLCV DataFrame
