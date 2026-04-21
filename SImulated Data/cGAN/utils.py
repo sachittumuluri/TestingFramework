@@ -7,20 +7,6 @@ import torch
 def generate_sequences(generator, n_sequences, seq_len, noise_dim,
                        regime_label=0, device='cpu'):
     """
-    Sample synthetic return sequences for a SPECIFIC regime.
-
-    CHANGED from original: now accepts regime_label parameter.
-
-    This is the core INFERENCE function — after training, this is how you
-    create regime-specific synthetic data for backtesting, stress-testing, etc.
-
-    Example usage:
-        # Generate 1000 "Crash" sequences for VaR estimation
-        crash_data = generate_sequences(gen, 1000, 50, 32, regime_label=3)
-
-        # Generate 1000 "Bullish" sequences for optimistic scenario analysis
-        bull_data = generate_sequences(gen, 1000, 50, 32, regime_label=0)
-
     Args:
         generator:     Trained Generator network (will be set to eval mode)
         n_sequences:   How many sequences to generate
@@ -35,9 +21,9 @@ def generate_sequences(generator, n_sequences, seq_len, noise_dim,
         Each row is one sequence of normalized returns for the specified regime.
     """
     generator.eval()
-
     with torch.no_grad():
         noise = torch.randn(n_sequences, seq_len, noise_dim, device=device)
+
         labels = torch.full(
             (n_sequences,), regime_label, dtype=torch.long, device=device
         )
@@ -45,7 +31,6 @@ def generate_sequences(generator, n_sequences, seq_len, noise_dim,
         fake = generator(noise, labels)
 
     generator.train()
-
     return fake.squeeze(-1).cpu().numpy()
 
 
@@ -53,9 +38,6 @@ def generate_sequences(generator, n_sequences, seq_len, noise_dim,
 def generate_all_regimes(generator, n_per_regime, seq_len, noise_dim,
                           num_regimes=4, regime_names=None, device='cpu'):
     """
-    This produces a dictionary of regime → sequences, making it easy to
-    compare across regimes in a single call.
-
     Args:
         generator:      Trained Generator network
         n_per_regime:   Sequences per regime
@@ -86,8 +68,6 @@ def generate_all_regimes(generator, n_per_regime, seq_len, noise_dim,
 
 def compute_acf(series, max_lag=50):
     """
-    Compute the sample autocorrelation function (ACF) of a 1D series.
-
     ACF(k) = Cov(x_t, x_{t+k}) / Var(x_t)
     """
     n = len(series)
@@ -117,7 +97,7 @@ def compute_statistics(returns):
         'mean':           float(np.mean(returns)),
         'std':            float(np.std(returns)),
         'skewness':       float(stats.skew(returns)),
-        'kurtosis':       float(stats.kurtosis(returns)),
+        'kurtosis':       float(stats.kurtosis(returns)),   # excess kurtosis
         'min':            float(np.min(returns)),
         'max':            float(np.max(returns)),
         'JB_stat':        float(stats.jarque_bera(returns).statistic),
@@ -146,10 +126,6 @@ def compare_statistics(real_returns, fake_returns):
 
 def compare_regime_statistics(real_regime_data, fake_regime_data, regime_names=None):
     """
-    This is the key quantitative test for conditional generation quality.
-    For each regime, we check if the generated data matches the real data's
-    statistical properties.
-
     What to look for:
       - Each regime should have ratios close to 1.0
       - Crash should have higher std, kurtosis than Bullish
@@ -276,13 +252,6 @@ def plot_evaluation(real_returns, fake_returns, title_prefix="", save_path=None)
 
 def plot_regime_comparison(fake_regime_data, regime_names=None, save_path=None):
     """
-
-    This is the key VISUAL test for conditional generation:
-      - Crash columns should show plunging cumulative returns
-      - Bullish columns should show rising cumulative returns
-      - Sideways columns should meander around zero
-      - Bearish columns should drift downward
-
     Args:
         fake_regime_data: Dict {regime_label: 2D numpy array (n_sequences, seq_len)}
         regime_names:     Dict {label: name}
@@ -292,7 +261,7 @@ def plot_regime_comparison(fake_regime_data, regime_names=None, save_path=None):
         regime_names = {k: f"Regime_{k}" for k in fake_regime_data}
 
     n_regimes = len(fake_regime_data)
-    n_samples = 3 
+    n_samples = 3
 
     fig, axes = plt.subplots(
         n_samples, n_regimes, figsize=(4 * n_regimes, 2.5 * n_samples)
@@ -301,7 +270,6 @@ def plot_regime_comparison(fake_regime_data, regime_names=None, save_path=None):
         axes = axes.reshape(-1, 1)
     if n_samples == 1:
         axes = axes.reshape(1, -1)
-
 
     colors = ['forestgreen', 'crimson', 'gray', 'darkred']
 
@@ -333,11 +301,11 @@ def plot_regime_comparison(fake_regime_data, regime_names=None, save_path=None):
 
 def plot_training_history(history, save_path=None):
     """
-    Plot training metrics over epochs.  (UNCHANGED from original)
+    Plot training metrics over epochs.
     """
     fig, axes = plt.subplots(1, 3, figsize=(16, 4))
 
-    # --- Wasserstein distance ---
+
     ax = axes[0]
     ax.plot(history['wasserstein_dist'], color='green', linewidth=0.8)
     ax.set_title('Estimated Wasserstein Distance')

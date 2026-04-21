@@ -5,38 +5,8 @@ from tqdm import tqdm
 
 
 def compute_gradient_penalty(critic, real_data, fake_data, labels, device):
-    """
-    Compute the gradient penalty (GP) term for CONDITIONAL WGAN-GP.
-
-    CHANGED from original:
-      - Now accepts `labels` parameter
-      - Passes labels to the critic when evaluating interpolated points
-      - GP is computed w.r.t. the SEQUENCE only (labels pass through unchanged)
-
-    The gradient penalty ENFORCES the 1-Lipschitz constraint on the critic:
-        For all x, y:  ||∇_x D(x, y)||₂ ≤ 1
-
-    We penalize the gradient norm at interpolated points between real and fake:
-        x̃ = α · fake + (1 - α) · real
-        GP = E[ (||∇_x̃ D(x̃, y)||₂ - 1)² ]
-
-    Note: y (labels) is NOT interpolated — it's the same for the whole batch.
-    We only want the Lipschitz constraint in the SEQUENCE space.
-
-    Args:
-        critic:    Discriminator network
-        real_data: Real return sequences, shape (B, T, 1)
-        fake_data: Generated return sequences, shape (B, T, 1)
-        labels:    Regime labels, shape (B,) — same labels for real and fake
-        device:    torch device
-
-    Returns:
-        Scalar gradient penalty loss
-    """
     batch_size = real_data.size(0)
-
     alpha = torch.rand(batch_size, 1, 1, device=device)
-
     interpolated = (alpha * fake_data + (1.0 - alpha) * real_data).detach()
     interpolated.requires_grad_(True)
 
@@ -49,6 +19,7 @@ def compute_gradient_penalty(critic, real_data, fake_data, labels, device):
         create_graph=True,
         retain_graph=True,
     )[0]
+
     gradients_flat = gradients.reshape(batch_size, -1)
     gradient_norm = gradients_flat.norm(2, dim=1)
     penalty = ((gradient_norm - 1.0) ** 2).mean()
@@ -70,29 +41,21 @@ def train_gan(
     checkpoint_dir='checkpoints',
     log_interval=10,
     num_regimes=4,
+    # ── NEW: pass these so the checkpoint is self-contained ──
+    global_mu=None,
+    global_sigma=None,
+    regime_map=None,
+    embed_dim=None,
 ):
     """
     Full CONDITIONAL WGAN-GP training loop.
 
-    Args:
-        generator:       Generator network (conditional)
-        discriminator:   Critic network (conditional)
-        dataloader:      DataLoader yielding (real_windows, labels) batches
-        n_epochs:        Total training epochs
-        noise_dim:       Must match generator's noise_dim
-        lr_g:            Generator learning rate
-        lr_d:            Critic learning rate
-        n_critic:        Critic updates per generator update (5 is standard)
-        lambda_gp:       Gradient penalty weight (10.0 from WGAN-GP paper)
-        device:          'cpu' or 'cuda'
-        checkpoint_dir:  Where to save model checkpoints
-        log_interval:    Print losses every N epochs
-        num_regimes:     Number of regime categories
-
-    Returns:
-        Dictionary with training history (for plotting)
+    NEW params (for saving a self-contained checkpoint):
+        global_mu:     Global mean of training log returns
+        global_sigma:  Global std of training log returns
+        regime_map:    Dict mapping regime names to integer labels
+        embed_dim:     Regime embedding dimension (read from generator if None)
     """
-
     optimizer_G = torch.optim.Adam(
         generator.parameters(), lr=lr_g, betas=(0.5, 0.9)
     )
@@ -106,7 +69,10 @@ def train_gan(
     sample_batch, sample_labels = next(iter(dataloader))
     seq_len = sample_batch.shape[1]
 
-    # Training history for monitoring
+    # Read embed_dim from model if not explicitly passed
+    if embed_dim is None:
+        embed_dim = generator.embed_dim
+
     history = {
         'critic_loss': [],
         'generator_loss': [],
@@ -115,7 +81,6 @@ def train_gan(
     }
 
     os.makedirs(checkpoint_dir, exist_ok=True)
-
 
     n_params_g = sum(p.numel() for p in generator.parameters())
     n_params_d = sum(p.numel() for p in discriminator.parameters())
@@ -140,7 +105,6 @@ def train_gan(
     print(f"  Critic params:    {n_params_d:,}")
     print(f"{'=' * 60}\n")
 
-    # MAIN TRAINING LOOP
     for epoch in range(n_epochs):
 
         epoch_d_losses = []
@@ -153,9 +117,9 @@ def train_gan(
             labels = labels.to(device)
             batch_size_actual = real_data.size(0)
 
+            # ═══ PHASE 1: Train Critic ═══
             for _ in range(n_critic):
 
-                # --- Generate fake data ---
                 noise = torch.randn(
                     batch_size_actual, seq_len, noise_dim, device=device
                 )
@@ -186,6 +150,7 @@ def train_gan(
                 epoch_w_dists.append(w_dist.item())
                 epoch_gps.append(gp.item())
 
+            # ═══ PHASE 2: Train Generator ═══
             noise = torch.randn(
                 batch_size_actual, seq_len, noise_dim, device=device
             )
@@ -197,14 +162,12 @@ def train_gan(
 
             optimizer_G.zero_grad()
             g_loss.backward()
-
-            # Gradient clipping for the generator's LSTM
             torch.nn.utils.clip_grad_norm_(generator.parameters(), max_norm=1.0)
-
             optimizer_G.step()
 
             epoch_g_losses.append(g_loss.item())
 
+        # ── End of epoch ──
         avg_d_loss = np.mean(epoch_d_losses)
         avg_g_loss = np.mean(epoch_g_losses)
         avg_w_dist = np.mean(epoch_w_dists)
@@ -224,7 +187,7 @@ def train_gan(
                 f"GP: {avg_gp:.4f}"
             )
 
-
+        # ── Save checkpoints (CHANGED: now saves FULL config) ──
         save_interval = max(1, n_epochs // 5)
         if (epoch + 1) % save_interval == 0 or (epoch + 1) == n_epochs:
             ckpt_path = os.path.join(
@@ -237,7 +200,20 @@ def train_gan(
                 'optimizer_G_state_dict': optimizer_G.state_dict(),
                 'optimizer_D_state_dict': optimizer_D.state_dict(),
                 'history': history,
-                'num_regimes': num_regimes,
+                # ── NEW: everything needed to reproduce generation ──
+                'config': {
+                    'noise_dim':   noise_dim,
+                    'hidden_dim':  generator.hidden_dim,
+                    'num_layers':  generator.num_layers,
+                    'output_dim':  1,
+                    'dropout':     generator.lstm.dropout if generator.num_layers > 1 else 0.0,
+                    'num_regimes': num_regimes,
+                    'embed_dim':   embed_dim,
+                    'seq_len':     seq_len,
+                },
+                'global_mu':    global_mu,
+                'global_sigma': global_sigma,
+                'regime_map':   regime_map,
             }, ckpt_path)
 
     print(f"\n  Training complete.")

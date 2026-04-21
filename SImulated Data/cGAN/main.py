@@ -25,26 +25,26 @@ def main():
 
     config = {
         # --- Data ---
-        'data_dir':    'regime_data',          # Directory for regime CSVs
-        'price_col':   'Close',                # Column with prices
-        'seq_len':     30,                     # Window length (T)
-        'stride':      2,                      # Window stride
-        'batch_size':  64,                     # Batch size
+        'data_dir':    'regime_data',
+        'price_col':   'Close',
+        'seq_len':     30,
+        'stride':      2,
+        'batch_size':  64,
 
         # --- Model Architecture ---
-        'noise_dim':   32,                     # Noise vector dimension per timestep
-        'hidden_dim':  256,                    # LSTM hidden state size
-        'num_layers':  2,                      # Stacked LSTM layers
-        'dropout':     0.1,                    # Dropout rate
-        'num_regimes': 4,                      # Number of market regimes
-        'embed_dim':   64,                     # Regime embedding dimension
+        'noise_dim':   32,
+        'hidden_dim':  256,
+        'num_layers':  2,
+        'dropout':     0.1,
+        'num_regimes': 4,
+        'embed_dim':   64,
 
         # --- Training ---
-        'n_epochs':    1000,                    # Training epochs
-        'lr_g':        3e-4,                   # Generator learning rate
-        'lr_d':        5e-5,                   # Critic learning rate
-        'n_critic':    5,                      # Critic steps per generator step
-        'lambda_gp':   10.0,                   # Gradient penalty weight
+        'n_epochs':    1000,
+        'lr_g':        3e-4,
+        'lr_d':        5e-5,
+        'n_critic':    5,
+        'lambda_gp':   10.0,
 
         # --- System ---
         'device':      'cuda' if torch.cuda.is_available() else 'cpu',
@@ -54,22 +54,23 @@ def main():
     regime_map = DEFAULT_REGIME_MAP
     regime_names = DEFAULT_REGIME_NAMES
 
-
     torch.manual_seed(config['seed'])
     np.random.seed(config['seed'])
     if config['device'] == 'cuda':
         torch.cuda.manual_seed_all(config['seed'])
 
+    #______________________________________________________
+    # STEP 1: Prepare Data
+    
     print("\n" + "=" * 60)
     print("  STEP 1: Preparing Multi-Regime Data")
     print("=" * 60)
 
-
     csv_label_pairs = [
-    ('bullish_SPY_data.csv', 'Bullish'),
-    ('bearish_SPY_data.csv', 'Bearish'),
-    ('sideways_SPY_data.csv', 'Sideways'),
-    ('crash_SPY_data.csv', 'Crash'),
+        ('bullish_SPY_data.csv', 'Bullish'),
+        ('bearish_SPY_data.csv', 'Bearish'),
+        ('sideways_SPY_data.csv', 'Sideways'),
+        ('crash_SPY_data.csv', 'Crash'),
     ]
 
     custom_strides = {
@@ -85,6 +86,9 @@ def main():
         regime_map=regime_map,
         price_col=config['price_col'],
     )
+
+    #______________________________________________________
+    # STEP 2: Create Model
 
     print("\n" + "=" * 60)
     print("  STEP 2: Creating Conditional Models")
@@ -112,6 +116,9 @@ def main():
     print(f"\n  Generator:\n{generator}")
     print(f"\n  Discriminator:\n{discriminator}")
 
+    #______________________________________________________
+    # STEP 3: Train
+
     print("\n" + "=" * 60)
     print("  STEP 3: Training Conditional WGAN-GP")
     print("=" * 60)
@@ -128,13 +135,20 @@ def main():
         lambda_gp=config['lambda_gp'],
         device=config['device'],
         num_regimes=config['num_regimes'],
+
+        global_mu=multi_dataset.global_mu,
+        global_sigma=multi_dataset.global_sigma,
+        regime_map=regime_map,
+        embed_dim=config['embed_dim'],
     )
+
+    #______________________________________________________
+    # STEP 4: Evaluate Per-Regime Results
 
     print("\n" + "=" * 60)
     print("  STEP 4: Evaluating Per-Regime Results")
     print("=" * 60)
 
-    # --- Generate synthetic sequences for EACH regime ---
     n_eval = 200
 
     fake_regime_data = generate_all_regimes(
@@ -143,16 +157,13 @@ def main():
         regime_names, config['device']
     )
 
-    # --- Collect real data per regime for comparison ---
     real_regime_data = {}
     for label, ds in multi_dataset.regime_datasets.items():
         real_regime_data[label] = ds.windows[:n_eval]
 
-    # --- Per-regime statistical comparison ---
     print("\n  ── Per-Regime Statistical Comparison ──")
     compare_regime_statistics(real_regime_data, fake_regime_data, regime_names)
 
-    # --- Per-regime 4-panel visual comparison ---
     for label in sorted(fake_regime_data.keys()):
         name = regime_names.get(label, f"Regime_{label}")
         if label in real_regime_data:
@@ -160,15 +171,12 @@ def main():
             fake_flat = fake_regime_data[label].flatten()
             plot_evaluation(real_flat, fake_flat, title_prefix=f"{name}: ")
 
-    # --- Regime comparison: cumulative return paths ---
     plot_regime_comparison(fake_regime_data, regime_names)
-
-    # --- Training curves ---
     plot_training_history(history)
 
-    print("\n  Done.")
+    print("\n Done: ")
 
-    # Generate 1000 crash scenarios for risk analysis
+
     crash_label = regime_map['Crash']
     crash_sequences = generate_sequences(
         generator, 1000, config['seq_len'],
@@ -176,7 +184,6 @@ def main():
         device=config['device']
     )
 
-    # Denormalize to get actual log returns
     crash_log_returns = multi_dataset.denormalize(crash_sequences.flatten())
 
     print(f"\n  Generated 1000 Crash sequences:")

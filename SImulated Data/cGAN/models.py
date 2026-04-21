@@ -3,6 +3,7 @@ import torch.nn as nn
 
 
 class Generator(nn.Module):
+
     def __init__(self, noise_dim=32, hidden_dim=128, num_layers=2,
                  output_dim=1, dropout=0.1, num_regimes=4, embed_dim=16):
         """
@@ -46,33 +47,12 @@ class Generator(nn.Module):
         )
 
     def forward(self, z, labels):
-        """
-        Transform noise into regime-specific synthetic returns.
 
-        Args:
-            z:      Noise tensor, shape (batch_size, seq_len, noise_dim)
-                    Each z[b, t, :] is an i.i.d. sample from N(0, I).
-            labels: Regime labels, shape (batch_size,)
-                    Integer tensor with values in [0, num_regimes - 1].
-
-        Returns:
-            Synthetic normalized returns, shape (batch_size, seq_len, 1)
-
-        Shape trace (B=64, T=50, noise_dim=32, embed_dim=16, hidden=128):
-            z:              (64, 50, 32)
-            regime_emb:     (64, 16)       ← one embedding per sample
-            regime_expand:  (64, 50, 16)   ← same embedding at every timestep
-            lstm_input:     (64, 50, 48)   ← noise + regime concatenated
-            lstm_out:       (64, 50, 128)  ← hidden state at each timestep
-            output:         (64, 50, 1)    ← one return per timestep
-        """
         batch_size, seq_len, _ = z.shape
 
         regime_emb = self.regime_embedding(labels)
         regime_expanded = regime_emb.unsqueeze(1).expand(-1, seq_len, -1)
-
         lstm_input = torch.cat([z, regime_expanded], dim=-1)
-
         lstm_out, _ = self.lstm(lstm_input)
         output = self.output_head(lstm_out)
 
@@ -80,7 +60,7 @@ class Generator(nn.Module):
 
 
 class Discriminator(nn.Module):
-
+   
     def __init__(self, input_dim=1, hidden_dim=128, num_layers=2,
                  dropout=0.1, num_regimes=4, embed_dim=16):
         """
@@ -103,6 +83,7 @@ class Discriminator(nn.Module):
             nn.Linear(input_dim, hidden_dim),
             nn.LeakyReLU(0.2),
         )
+
         self.lstm = nn.LSTM(
             input_size=hidden_dim,
             hidden_size=hidden_dim,
@@ -122,7 +103,7 @@ class Discriminator(nn.Module):
 
     def forward(self, x, labels):
         """
-        Score a (sequence, regime) pair for realism.
+        Score a (sequence, regime) pair
 
         Args:
             x:      Return sequence, shape (batch_size, seq_len, 1)
@@ -145,10 +126,13 @@ class Discriminator(nn.Module):
         """
 
         features = self.input_projection(x)
+
         lstm_out, (h_n, c_n) = self.lstm(features)
         last_hidden = h_n[-1]
+
         regime_emb = self.regime_embedding(labels)
         combined = torch.cat([last_hidden, regime_emb], dim=-1)
         score = self.score_head(combined)
+
 
         return score
