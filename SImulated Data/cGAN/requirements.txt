@@ -1,0 +1,18 @@
+# =============================================================================
+# requirements.txt — Conditional Financial Time Series WGAN-GP
+# =============================================================================
+#
+# Install with:
+#   pip install -r requirements.txt
+#
+# For GPU support (CUDA), install PyTorch separately first:
+#   https://pytorch.org/get-started/locally/
+#
+# =============================================================================
+
+torch>=2.0.0
+numpy>=1.24.0
+pandas>=2.0.0
+matplotlib>=3.7.0
+scipy>=1.10.0
+tqdm>=4.65.0
